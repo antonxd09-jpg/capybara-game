@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Capybara Chef</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;touch-action:none}
+body{background:#1a0a2e;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;height:100vh;overflow:hidden;font-family:'Arial',sans-serif}
+#ui{width:100%;max-width:420px;padding:10px;display:flex;justify-content:space-between;align-items:center}
+.score{color:#ffd700;font-size:22px;font-weight:bold;text-shadow:0 0 10px #ff8800}
+.level{color:#a0f0ff;font-size:16px}
+#canvas{width:100%;max-width:420px;cursor:pointer}
+#msg{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:28px;font-weight:bold;text-align:center;text-shadow:0 0 20px #ff4488;pointer-events:none;opacity:0;transition:opacity 0.3s}
+</style>
+</head>
+<body>
+<div id="ui">
+  <div class="score">🍳 <span id="scoreNum">0</span></div>
+  <div class="level" id="levelTxt">Рівень 1</div>
+  <div class="score">❤️ <span id="livesNum">3</span></div>
+</div>
+<canvas id="canvas"></canvas>
+<div id="msg" id="msg"></div>
+
+<script>
+const C = document.getElementById('canvas');
+const ctx = C.getContext('2d');
+const W = C.width = Math.min(window.innerWidth, 420);
+const H = C.height = window.innerHeight - 60;
+
+// Audio
+const AC = new (window.AudioContext || window.webkitAudioContext)();
+function playSound(freq, type, dur, vol=0.3) {
+  try {
+    const o = AC.createOscillator();
+    const g = AC.createGain();
+    o.connect(g); g.connect(AC.destination);
+    o.frequency.value = freq;
+    o.type = type;
+    g.gain.setValueAtTime(vol, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch(e){}
+}
+function chop() { playSound(300,'sawtooth',0.08,0.4); playSound(200,'square',0.06,0.3); }
+function sizzle() {
+  const buf = AC.createBuffer(1,AC.sampleRate*0.3,AC.sampleRate);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*0.3;
+  const src = AC.createBufferSource();
+  const f = AC.createBiquadFilter();
+  f.type='highpass'; f.frequency.value=2000;
+  src.buffer=buf; src.connect(f); f.connect(AC.destination);
+  src.start();
+}
+function ding() { playSound(880,'sine',0.5,0.5); setTimeout(()=>playSound(1100,'sine',0.4,0.4),150); }
+function happy() { [523,659,784,1047].forEach((f,i)=>setTimeout(()=>playSound(f,'sine',0.3,0.4),i*100)); }
+
+// Game state
+let state = 'chop'; // chop, cook, feed, done
+let score = 0, lives = 3, level = 1;
+let ingredients = [];
+let pan = { x: W/2, y: H*0.72, r: 70 };
+let panFill = 0;
+let capybara = { x: W/2, y: H*0.82, mouth: 0, happy: 0 };
+let particles = [];
+let cookTimer = 0, cookMax = 180;
+let chopCount = 0, chopNeeded = 5;
+let flame = 0;
+let feedAnim = 0;
+let msgTimer = 0;
+let shakeX = 0;
+
+const INGREDIENTS = [
+  { name:'🍅 Томат',  color:'#e63946', shape:'circle' },
+  { name:'🥕 Морква', color:'#f4a261', shape:'rect'   },
+  { name:'🧅 Цибуля', color:'#9b2335', shape:'circle' },
+  { name:'🫑 Перець', color:'#2a9d8f', shape:'rect'   },
+  { name:'🍄 Гриб',   color:'#8d5524', shape:'circle' },
+];
+
+function spawnIngredient() {
+  const t = INGREDIENTS[Math.floor(Math.random()*INGREDIENTS.length)];
+  const cols = 3;
+  const idx = ingredients.length % cols;
+  ingredients.push({
+    x: W*0.2 + idx*(W*0.3),
+    y: H*0.18 + Math.floor(ingredients.length/cols)*90,
+    r: 36,
+    color: t.color,
+    shape: t.shape,
+    name: t.name,
+    chops: 0, maxChops: 3,
+    scale: 1, rotation: 0,
+    vx: 0, vy: 0,
+    chopped: false,
+    alpha: 1
+  });
+}
+
+function initLevel() {
+  state = 'chop';
+  ingredients = [];
+  chopCount = 0;
+  chopNeeded = 3 + level;
+  panFill = 0;
+  cookTimer = 0;
+  feedAnim = 0;
+  flame = 0;
+  for(let i=0; i<Math.min(3+level,6); i++) spawnIngredient();
+}
+
+initLevel();
+
+function addParticles(x, y, color, n=8) {
+  for(let i=0;i<n;i++) {
+    const a = Math.random()*Math.PI*2;
+    const s = 2+Math.random()*4;
+    particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s-2,
+      color, size: 4+Math.random()*6, life: 1, decay: 0.03+Math.random()*0.03 });
+  }
+}
+
+function showMsg(txt) {
+  const el = document.getElementById('msg');
+  el.textContent = txt;
+  el.style.opacity = 1;
+  msgTimer = 90;
+}
+
+// Draw helpers
+function drawCapybara(x, y, happy, mouthOpen) {
+  ctx.save();
+  if(happy > 0) { ctx.translate(x, y); const s = 1 + Math.sin(happy*0.3)*0.05; ctx.scale(s,s); ctx.translate(-x,-y); }
+  // Body
+  ctx.fillStyle = '#8B6914';
+  ctx.beginPath(); ctx.ellipse(x, y+10, 55, 35, 0, 0, Math.PI*2); ctx.fill();
+  // Head
+  ctx.fillStyle = '#9B7A1E';
+  ctx.beginPath(); ctx.ellipse(x, y-20, 38, 28, 0, 0, Math.PI*2); ctx.fill();
+  // Ears
+  ctx.fillStyle = '#7a5a0e';
+  ctx.beginPath(); ctx.ellipse(x-28, y-38, 10, 8, -0.5, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(x+28, y-38, 10, 8, 0.5, 0, Math.PI*2); ctx.fill();
+  // Eyes
+  ctx.fillStyle = happy>0 ? '#ff8800' : '#1a0a2e';
+  if(happy>0) {
+    ctx.beginPath(); ctx.arc(x-13, y-24, 6, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x+13, y-24, 6, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(x-11, y-26, 2, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x+15, y-26, 2, 0, Math.PI*2); ctx.fill();
+  } else {
+    ctx.beginPath(); ctx.arc(x-13, y-24, 5, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x+13, y-24, 5, 0, Math.PI*2); ctx.fill();
+  }
+  // Nose
+  ctx.fillStyle = '#5a3a0a';
+  ctx.beginPath(); ctx.ellipse(x, y-10, 12, 7, 0, 0, Math.PI*2); ctx.fill();
+  // Mouth
+  if(mouthOpen > 0.3) {
+    ctx.fillStyle = '#3a1a0a';
+    ctx.beginPath(); ctx.ellipse(x, y-5+mouthOpen*8, 14*mouthOpen, 8*mouthOpen, 0, 0, Math.PI); ctx.fill();
+  }
+  // Legs
+  ctx.fillStyle = '#7a5a0e';
+  [-30,-10,10,30].forEach(ox => {
+    ctx.beginPath(); ctx.ellipse(x+ox, y+40, 10, 14, 0, 0, Math.PI*2); ctx.fill();
+  });
+  ctx.restore();
+}
+
+function drawIngredient(ing) {
+  if(ing.alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = ing.alpha;
+  ctx.translate(ing.x, ing.y);
+  ctx.rotate(ing.rotation);
+  ctx.scale(ing.scale, ing.scale);
+  
+  if(ing.shape === 'circle') {
+    ctx.fillStyle = ing.color;
+    ctx.beginPath(); ctx.arc(0, 0, ing.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 3; ctx.stroke();
+  } else {
+    ctx.fillStyle = ing.color;
+    ctx.beginPath();
+    ctx.roundRect(-ing.r*0.8, -ing.r*0.8, ing.r*1.6, ing.r*1.6, 12);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 3; ctx.stroke();
+  }
+  
+  // Chop marks
+  if(ing.chops > 0) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 2;
+    for(let i=0; i<ing.chops; i++) {
+      const a = (i/3)*Math.PI - Math.PI/4;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a)*10, Math.sin(a)*10);
+      ctx.lineTo(Math.cos(a)*-10, Math.sin(a)*-10);
+      ctx.stroke();
+    }
+  }
+  
+  // Emoji label
+  ctx.font = '20px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(ing.name.split(' ')[0], 0, -ing.r-2);
+  
+  ctx.restore();
+}
+
+function drawPan() {
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.beginPath(); ctx.ellipse(pan.x+5, pan.y+8, pan.r, pan.r*0.3, 0, 0, Math.PI*2); ctx.fill();
+  
+  // Pan body
+  ctx.fillStyle = '#2d2d2d';
+  ctx.beginPath(); ctx.ellipse(pan.x, pan.y, pan.r+8, pan.r*0.45+8, 0, 0, Math.PI*2); ctx.fill();
+  
+  // Pan interior
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath(); ctx.ellipse(pan.x, pan.y, pan.r, pan.r*0.4, 0, 0, Math.PI*2); ctx.fill();
+  
+  // Food in pan
+  if(panFill > 0) {
+    const colors = ['#e63946','#f4a261','#9b2335','#2a9d8f'];
+    ctx.fillStyle = `rgba(${panFill>50?'200,120,30':'150,80,20'},${Math.min(panFill/100,1)})`;
+    ctx.beginPath(); ctx.ellipse(pan.x, pan.y, pan.r*0.85*(panFill/100+0.3), pan.r*0.3*(panFill/100+0.3), 0, 0, Math.PI*2); ctx.fill();
+    
+    // Bubble particles when cooking
+    if(state === 'cook' && Math.random() < 0.3) {
+      addParticles(pan.x + (Math.random()-0.5)*pan.r, pan.y, '#ff8800', 1);
+    }
+  }
+  
+  // Handle
+  ctx.fillStyle = '#3d2800';
+  ctx.beginPath();
+  ctx.roundRect(pan.x+pan.r, pan.y-10, 60, 20, 10);
+  ctx.fill();
+  
+  // Flame
+  if(state === 'cook') {
+    flame += 0.1;
+    for(let i=-2;i<=2;i++) {
+      const h = 20+Math.sin(flame+i*1.3)*8;
+      const c = `hsl(${30+i*10},100%,${50+panFill/3}%)`;
+      ctx.fillStyle = c;
+      ctx.beginPath();
+      ctx.ellipse(pan.x+i*15, pan.y+pan.r*0.4+h/2, 8, h/2, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawCookBar() {
+  if(state !== 'cook') return;
+  const bw = W*0.7, bh = 24;
+  const bx = (W-bw)/2, by = H*0.52;
+  
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.beginPath(); ctx.roundRect(bx-3, by-3, bw+6, bh+6, 14); ctx.fill();
+  
+  ctx.fillStyle = '#333';
+  ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 12); ctx.fill();
+  
+  const pct = cookTimer/cookMax;
+  const grad = ctx.createLinearGradient(bx,0,bx+bw,0);
+  grad.addColorStop(0,'#ff4500');
+  grad.addColorStop(0.5,'#ff8800');
+  grad.addColorStop(1,'#ffd700');
+  ctx.fillStyle = grad;
+  ctx.beginPath(); ctx.roundRect(bx, by, bw*pct, bh, 12); ctx.fill();
+  
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 13px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('🍳 Готуємо... ' + Math.floor(pct*100) + '%', W/2, by+16);
+}
+
+function drawBackground() {
+  // Kitchen bg
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,'#1a0a2e');
+  grad.addColorStop(1,'#2d1b4e');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,W,H);
+  
+  // Counter
+  ctx.fillStyle = '#3d2a1a';
+  ctx.fillRect(0, H*0.6, W, H*0.4);
+  ctx.fillStyle = '#5a3d22';
+  ctx.fillRect(0, H*0.6, W, 12);
+  
+  // Tiles
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  for(let x=0;x<W;x+=40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H*0.6); ctx.stroke(); }
+  for(let y=0;y<H*0.6;y+=40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+}
+
+function drawChopHint() {
+  if(state !== 'chop') return;
+  ctx.fillStyle = 'rgba(255,215,0,0.8)';
+  ctx.font = 'bold 16px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText(`Нарізай! ${chopCount}/${chopNeeded}`, W/2, H*0.08);
+  
+  // Arrow to pan
+  if(chopCount > 0 && ingredients.some(i=>i.chopped)) {
+    ctx.fillStyle = 'rgba(0,255,100,0.7)';
+    ctx.font = '14px Arial';
+    ctx.fillText('⬇ Кидай у сковороду!', W/2, H*0.62);
+  }
+}
+
+function handleTap(tx, ty) {
+  if(AC.state === 'suspended') AC.resume();
+  
+  if(state === 'done') {
+    level++;
+    if(level > 5) level = 1;
+    score = 0;
+    lives = 3;
+    document.getElementById('scoreNum').textContent = score;
+    document.getElementById('livesNum').textContent = lives;
+    initLevel();
+    return;
+  }
+  
+  if(state === 'feed') {
+    // tap capybara to feed
+    const dx = tx - capybara.x, dy = ty - (H*0.82);
+    if(Math.sqrt(dx*dx+dy*dy) < 70) {
+      capybara.mouth = 1;
+      capybara.happy = 60;
+      feedAnim = 1;
+      ding(); happy();
+      score += 10*level;
+      document.getElementById('scoreNum').textContent = score;
+      showMsg('😋 Капібара задоволена!');
+      addParticles(capybara.x, H*0.75, '#ffd700', 15);
+      setTimeout(() => { state='done'; showMsg('🎉 Рівень пройдено!\nТап для продовження'); }, 1500);
+    }
+    return;
+  }
+  
+  if(state === 'cook') return;
+  
+  // Check ingredient tap
+  for(let i=0; i<ingredients.length; i++) {
+    const ing = ingredients[i];
+    if(ing.alpha <= 0) continue;
+    const dx = tx - ing.x, dy = ty - ing.y;
+    if(Math.sqrt(dx*dx+dy*dy) < ing.r + 10) {
+      ing.chops++;
+      ing.scale = 1.2;
+      ing.rotation += 0.3;
+      chop();
+      addParticles(ing.x, ing.y, ing.color, 6);
+      chopCount++;
+      document.getElementById('scoreNum').textContent = score + chopCount;
+      
+      if(ing.chops >= ing.maxChops) {
+        ing.chopped = true;
+        ing.scale = 0.8;
+        showMsg('✂️ Нарізано!');
+      }
+      
+      if(chopCount >= chopNeeded) {
+        // Move to pan
+        ingredients.forEach(i2 => { i2.chopped = true; });
+        panFill = Math.min(panFill + 30, 100);
+        sizzle();
+        state = 'cook';
+        cookTimer = 0;
+        showMsg('🔥 Готуємо!');
+      }
+      return;
+    }
+  }
+  
+  // Check pan tap (add chopped ingredients)
+  const dpx = tx - pan.x, dpy = ty - pan.y;
+  if(Math.sqrt(dpx*dpx+dpy*dpy) < pan.r && ingredients.some(i=>i.chopped && i.alpha > 0)) {
+    ingredients.filter(i=>i.chopped).forEach(ing => {
+      ing.alpha -= 0.5;
+      panFill = Math.min(panFill + 20, 100);
+    });
+    sizzle();
+    if(state === 'chop' && panFill > 30) {
+      state = 'cook';
+      showMsg('🔥 Готуємо!');
+    }
+  }
+}
+
+C.addEventListener('click', e => {
+  const r = C.getBoundingClientRect();
+  handleTap(e.clientX - r.left, e.clientY - r.top);
+});
+C.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const r = C.getBoundingClientRect();
+  const t = e.touches[0];
+  handleTap(t.clientX - r.left, t.clientY - r.top);
+}, {passive:false});
+
+function update() {
+  // Update particles
+  particles = particles.filter(p => p.life > 0);
+  particles.forEach(p => {
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.15;
+    p.life -= p.decay;
+    p.size *= 0.97;
+  });
+  
+  // Ingredient physics
+  ingredients.forEach(ing => {
+    if(ing.scale > 1) ing.scale -= 0.05;
+    if(ing.scale < 1 && !ing.chopped) ing.scale = 1;
+    if(ing.chopped && ing.alpha > 0 && state === 'cook') ing.alpha -= 0.02;
+  });
+  
+  // Cook timer
+  if(state === 'cook') {
+    cookTimer++;
+    if(cookTimer % 20 === 0) sizzle();
+    if(cookTimer >= cookMax) {
+      ding();
+      state = 'feed';
+      capybara.happy = 0;
+      showMsg('🍽️ Готово! Нагодуй капібару!');
+    }
+  }
+  
+  // Capybara animation
+  if(capybara.happy > 0) {
+    capybara.happy--;
+    capybara.mouth = Math.sin(capybara.happy*0.3)*0.8+0.2;
+  } else {
+    capybara.mouth = Math.max(0, capybara.mouth - 0.05);
+  }
+  
+  // Feed animation
+  if(feedAnim > 0 && feedAnim < 60) feedAnim++;
+  
+  // Message timer
+  if(msgTimer > 0) {
+    msgTimer--;
+    if(msgTimer === 0) document.getElementById('msg').style.opacity = 0;
+  }
+  
+  // Shake
+  shakeX *= 0.8;
+}
+
+function render() {
+  ctx.clearRect(0,0,W,H);
+  ctx.save();
+  if(shakeX) ctx.translate(shakeX*(Math.random()-0.5)*2, 0);
+  
+  drawBackground();
+  
+  // Ingredients
+  if(state === 'chop' || (state === 'cook' && cookTimer < 20)) {
+    ingredients.forEach(drawIngredient);
+  }
+  
+  drawPan();
+  drawCookBar();
+  drawChopHint();
+  
+  // Capybara (show during feed/done)
+  if(state === 'feed' || state === 'done') {
+    drawCapybara(capybara.x, H*0.82, capybara.happy, capybara.mouth);
+    
+    // Food flying to capybara
+    if(feedAnim > 0 && feedAnim < 40) {
+      const t = feedAnim/40;
+      const fx = pan.x + (capybara.x - pan.x)*t;
+      const fy = pan.y + (H*0.75 - pan.y)*t - Math.sin(t*Math.PI)*60;
+      ctx.font = '30px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('🍲', fx, fy);
+    }
+    
+    if(state === 'feed') {
+      ctx.fillStyle = 'rgba(255,215,0,0.9)';
+      ctx.font = 'bold 18px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('👆 Натисни на капібару!', W/2, H*0.65);
+    }
+  }
+  
+  // Particles
+  particles.forEach(p => {
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  });
+  
+  // Level info
+  document.getElementById('levelTxt').textContent = `Рівень ${level}`;
+  
+  ctx.restore();
+}
+
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
